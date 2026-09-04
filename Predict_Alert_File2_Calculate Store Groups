@@ -1,0 +1,108 @@
+--4th September
+
+-- =====================================================================
+-- FILE 2 OF 3 — CALCULATE STORE GROUPS
+-- Run this periodically (NOT every week) — only when you want store
+-- peer-groups recalculated. Processes ALL retailers currently in
+-- Retailer_Sales_History in one pass; NTILE is partitioned by
+-- retailer, so groups are always calculated separately per retailer,
+-- never mixed together.
+--
+-- FIX APPLIED: this file previously read from an abandoned table name
+-- ([2Retailer_Sales_Normalized]) that File 1 no longer populates.
+-- Now correctly reads from Haleon.Retailer_Sales_History.
+--
+-- OUTPUT: Haleon.Store_Groups — PERSISTENT. File 3 reads this table by
+-- this exact name; do not rename without updating File 3 too.
+-- =====================================================================
+
+
+-- =====================================================================
+-- STEP 1: Roll up to Store x Week
+-- =====================================================================
+IF OBJECT_ID('Haleon.F2_S1_Store_By_Week', 'U') IS NOT NULL
+    DROP TABLE Haleon.F2_S1_Store_By_Week;
+
+SELECT
+    retailer,
+    store_id,
+    year_week,
+    SUM(sales_qty)                                    AS weekly_sales_qty,
+    SUM(CASE WHEN sales_value > 0 THEN 1 ELSE 0 END)  AS weekly_skus_selling
+INTO Haleon.F2_S1_Store_By_Week
+FROM Haleon.Retailer_Sales_History
+GROUP BY retailer, store_id, year_week;
+
+
+-- =====================================================================
+-- STEP 2: Average weekly performance by store, over a rolling window
+-- Computed by RANK, not by year_week arithmetic — sidesteps the
+-- YYYYWW year-boundary problem (e.g. 202601 minus 12 does NOT
+-- correctly land 12 weeks earlier). The single most recent week
+-- (rank 1) is excluded on purpose, since including it would let a
+-- week's own data leak into its own peer benchmark.
+-- =====================================================================
+DECLARE @history_window_weeks INT = 12;   -- <-- the only parameter; rarely needs changing
+
+IF OBJECT_ID('Haleon.F2_S2_Avg_Sales_Store_By_Week', 'U') IS NOT NULL
+    DROP TABLE Haleon.F2_S2_Avg_Sales_Store_By_Week;
+
+WITH ranked_weeks AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (PARTITION BY retailer ORDER BY year_week DESC) AS week_rank
+    FROM Haleon.F2_S1_Store_By_Week
+)
+SELECT
+    retailer,
+    store_id,
+    AVG(CAST(weekly_sales_qty AS FLOAT))               AS avg_qty_by_week,
+    AVG(CAST(weekly_skus_selling AS FLOAT))            AS avg_skus_selling_per_week,
+    COUNT(DISTINCT year_week)                          AS weeks_available
+INTO Haleon.F2_S2_Avg_Sales_Store_By_Week
+FROM ranked_weeks
+WHERE week_rank BETWEEN 2 AND (@history_window_weeks + 1)
+GROUP BY retailer, store_id;
+
+-- Validate
+SELECT
+    retailer,
+    COUNT(*)                     AS total_stores,
+    MIN(weeks_available)         AS min_weeks_available,
+    MAX(weeks_available)         AS max_weeks_available,
+    AVG(avg_qty_by_week)         AS overall_avg_weekly_qty
+FROM Haleon.F2_S2_Avg_Sales_Store_By_Week
+GROUP BY retailer;
+
+
+-- =====================================================================
+-- STEP 3: Store groups — NTILE partitioned BY RETAILER
+-- =====================================================================
+DECLARE @num_groups INT = 20;   -- lower if a retailer has far fewer stores
+
+IF OBJECT_ID('Haleon.Store_Groups', 'U') IS NOT NULL
+    DROP TABLE Haleon.Store_Groups;
+
+SELECT
+    retailer,
+    store_id,
+    avg_qty_by_week,
+    avg_skus_selling_per_week,
+    NTILE(@num_groups) OVER (PARTITION BY retailer ORDER BY avg_qty_by_week DESC) AS group_id
+INTO Haleon.Store_Groups
+FROM Haleon.F2_S2_Avg_Sales_Store_By_Week;
+
+
+-- =====================================================================
+-- STEP 4: VALIDATION
+-- =====================================================================
+SELECT retailer, group_id, COUNT(*) AS num_stores
+FROM Haleon.Store_Groups
+GROUP BY retailer, group_id
+ORDER BY retailer, group_id;
+
+/* -----------------------------------------------------------------------
+   Once the groups above look right, this file is done for now. Re-run
+   only when you deliberately want groups recalculated — File 3 never
+   needs this file to run again just because a new week was scored.
+   ----------------------------------------------------------------------- */
