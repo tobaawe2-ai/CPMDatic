@@ -1,3 +1,12 @@
+Msg 207, Level 16, State 1, Line 102
+Invalid column name 'article_id'.
+Msg 207, Level 16, State 1, Line 103
+Invalid column name 'article_description'.
+Msg 207, Level 16, State 1, Line 105
+Invalid column name 'site_name'.
+
+Completion time: 2026-09-04T17:58:03.3862523+01:00
+
 retailer	store_id	sku_id	sku_description	year_week	week_commencing	sales_qty	sales_value	stock_qty
 Asda	4145	100150733	CORSODYL NO ALC WASH MINT 500ML	202636	2026-08-31	2.00	5.84	NULL
 Asda	4275	100142696	SENSODYNE PRONAMEL WHITE 75ML	202636	2026-08-31	1.00	4.57	NULL
