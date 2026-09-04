@@ -9,3 +9,442 @@ Asda	4200	100133358	CORSODYL TOOTHPASTE SENSIT 75ML	202636	2026-08-31	2.00	7.47	
 Asda	4453	100114651	NEXIUM CONTROL  7PK	202636	2026-08-31	1.00	5.35	NULL
 Asda	4145	100332671	CENTRUM WOMEN 50 PLUS 30PK	202636	2026-08-31	1.00	5.52	NULL
 Asda	4275	100142700	CORSODYL TOOTHPASTE REPAIR 75ML	202636	2026-08-31	2.00	9.13	NULL
+
+
+
+-- #######################################################################
+-- ##  BLOCK B — WEEKLY SCORING: SCORE THIS WEEK'S SINGLE FILE
+-- #######################################################################
+
+-- =====================================================================
+-- STEP 6: Normalize this week's landing table
+-- =====================================================================
+
+--DROP TABLE IF EXISTS Haleon.Haleon_Asda_CurrentWeek_Normalized
+DROP TABLE IF EXISTS Haleon.Asda_Sales_20260801_to_20260812_ScoringWeek;
+
+SELECT
+    [Site_Name]                              AS site_name,
+    [Site_Number]                            AS store_id,
+    [Article_ID]                             AS article_id,
+    [Article_Description]                    AS article_description,
+    CAST(CAST([Sales_Qty] AS DECIMAL(18,2)) AS INT) AS sales_qty,
+    CAST([Sales_Amount] AS NUMERIC(18,2))    AS sales_value,
+    CAST([Asda_Daily] AS DATE)               AS sale_date,
+    CAST([Week_Commencing] AS DATE)          AS week_commencing,
+    CAST([Year_Week_Number] AS INT)          AS year_week
+--INTO Haleon.Haleon_Asda_CurrentWeek_Normalized
+INTO Haleon.Asda_Sales_20260801_to_20260812_ScoringWeek
+FROM Haleon.Asda_Sales_2026_08_13;
+GO
+
+-- Validate: this file should contain exactly ONE distinct week
+SELECT
+    COUNT(*)                      AS total_rows,
+    COUNT(DISTINCT year_week)     AS distinct_weeks,
+    MIN(sale_date)                AS min_date,
+    MAX(sale_date)                AS max_date,
+    MIN(week_commencing)          AS week_commencing,
+    MAX(week_commencing)          AS week_commencing_check,  -- should match the MIN
+    COUNT(DISTINCT store_id)      AS distinct_stores,
+    COUNT(DISTINCT article_id)    AS distinct_articles
+FROM Haleon.Asda_Sales_20260801_to_20260812_ScoringWeek;
+GO
+-- If distinct_weeks > 1, this file isn't a single week — stop and check
+-- before proceeding, since Step 7 assumes single-week grain.
+
+
+-- =====================================================================
+-- STEP 7: Aggregate this week's daily rows to Article x Store x Week
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.[7Haleon_Asda_20260801_to_20260812_ScoringWeek_Weekly];
+
+SELECT
+    article_id,
+    article_description,
+    store_id,
+    site_name,
+    year_week,
+    week_commencing,
+    SUM(sales_value)                 AS sales_value,
+    SUM(sales_qty)                   AS sales_qty
+INTO Haleon.[7Haleon_Asda_20260801_to_20260812_ScoringWeek_Weekly]
+FROM Haleon.Asda_Sales_20260801_to_20260812_ScoringWeek
+GROUP BY  article_id,
+    article_description,
+    store_id,
+    site_name,
+    year_week,
+    week_commencing;
+GO
+
+--Check
+SELECT
+    COUNT(*)                       AS aggregated_rows,
+    COUNT(DISTINCT article_id)     AS distinct_articles,
+    COUNT(DISTINCT store_id)       AS distinct_stores,
+    COUNT(DISTINCT year_week)      AS distinct_weeks,
+    SUM(sales_qty)                 AS total_qty,
+    CAST(ROUND(SUM(sales_value), 2) AS NUMERIC(18,2)) AS total_value
+
+SELECT *  FROM Haleon.[7Haleon_Asda_20260801_to_20260812_ScoringWeek_Weekly]
+ORDER BY week_commencing DESC
+
+-- =====================================================================
+-- STEP 8: Join to store groups + safety check against the history window
+-- =====================================================================
+--DROP TABLE IF EXISTS Haleon.[8Haleon_Asda_20260801_to_20260812_with_Group];
+
+SELECT
+    s.article_id,
+    s.article_description,
+    s.store_id,
+    s.site_name,
+    s.year_week,
+    s.week_commencing,
+    s.sales_value,
+    s.sales_qty,
+    sg.group_id
+--INTO Haleon.[8Haleon_Asda_20260801_to_20260812_with_Group]
+--FROM Haleon.[7Haleon_Asda_20260801_to_20260812_ScoringWeek_Weekly] AS s
+FROM Haleon.Retailer_Sales_History s
+LEFT JOIN Haleon.[5Haleon_Asda_Store_Groups] AS sg
+    ON s.store_id = sg.store_id;
+GO
+
+-- Validation Check
+SELECT
+    COUNT(*)                                              AS rows_num,
+    COUNT(DISTINCT article_id)                            AS distinct_articles,
+    COUNT(DISTINCT store_id)                              AS distinct_stores,
+    SUM(CASE WHEN group_id IS NULL THEN 1 ELSE 0 END)     AS rows_missing_group
+FROM Haleon.[8Haleon_Asda_20260801_to_20260812_with_Group];
+GO
+-- rows_missing_group > 0 means a store in this week's file wasn't in
+-- the historical window used to build groups — e.g. a newly opened
+-- store, or your date range didn't cover it. Those rows will be
+-- benchmarked as NULL and excluded from scoring below.
+
+-- Safety check: the week being scored should be AFTER the historical
+-- window used for grouping, not inside it.
+DECLARE @scored_week_commencing DATE =
+    (SELECT MIN(week_commencing) FROM Haleon.[8Haleon_Asda_20260801_to_20260812_with_Group]);
+DECLARE @history_end_date_check DATE = '2026-07-27';  -- keep in sync with Step 4 above
+
+SELECT
+    @scored_week_commencing   AS scored_week_commencing,
+    @history_end_date_check   AS history_end_date,
+    CASE
+        WHEN @scored_week_commencing <= @history_end_date_check
+        THEN 'WARNING: scored week overlaps the history window — check your dates'
+        ELSE 'OK: scored week is after the history window'
+    END AS overlap_check;
+GO
+
+--SELECT MIN(week_commencing) FROM Haleon.[8Haleon_Asda_CurrentWeek_with_Group]
+SELECT TOP 10 *
+   
+FROM Haleon.[8Haleon_Asda_20260801_to_20260812_with_Group];
+
+
+-- =====================================================================
+-- STEP 9: Product benchmark — peer comparison within the current week
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.[9Haleon_Asda_20260801_to_20260812_Product_Group_Benchmark]
+
+SELECT
+    article_id,
+   article_description,
+    group_id,
+    AVG(CAST(sales_qty AS FLOAT))                                                    AS predicted_units,
+    AVG(CAST(sales_value AS FLOAT)) / NULLIF(AVG(CAST(sales_qty AS FLOAT)), 0)       AS avg_price
+INTO Haleon.[9Haleon_Asda_20260801_to_20260812_Product_Group_Benchmark]
+FROM Haleon.[8Haleon_Asda_20260801_to_20260812_with_Group]
+WHERE group_id IS NOT NULL
+GROUP BY article_id, group_id, article_description;
+GO
+
+--View & export data
+SELECT * FROM Haleon.[9Haleon_Asda_20260801_to_20260812_Product_Group_Benchmark]
+order BY group_id, article_description;
+
+
+-- =====================================================================
+-- STEP 10: Enrich current week's sales with the benchmark
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.[10Haleon_Asda_20260801_to_20260812_Sales_Enriched];
+
+SELECT
+    s.article_id,
+    s.article_description,
+    s.store_id,
+    s.site_name,
+    s.year_week,
+    s.week_commencing,
+    s.sales_value,
+    s.sales_qty,
+    s.group_id,
+    b.predicted_units,
+    b.avg_price
+INTO Haleon.[10Haleon_Asda_20260801_to_20260812_Sales_Enriched]
+FROM Haleon.[8Haleon_Asda_20260801_to_20260812_with_Group] AS s
+LEFT JOIN Haleon.[9Haleon_Asda_Product_Group_Benchmark] AS b
+    ON s.article_id = b.article_id AND s.group_id = b.group_id;
+GO
+
+-- Validate
+SELECT
+    COUNT(*)                                                       AS rows_num,
+    SUM(CASE WHEN predicted_units IS NULL THEN 1 ELSE 0 END)       AS rows_missing_predicted_units
+FROM Haleon.[10Haleon_Asda_20260801_to_20260812_Sales_Enriched];
+GO
+
+SELECT * FROM  Haleon.[10Haleon_Asda_20260801_to_20260812_Sales_Enriched]
+
+
+-- =====================================================================
+-- STEP 11: Flag/classify/price alerts (Low Sales only — no stock data)
+-- =====================================================================
+DECLARE @hurdle_rate FLOAT = 10.0;
+
+DROP TABLE IF EXISTS Haleon.[11Haleon_Asda_20260801_to_20260812_Alerts_Calc];
+
+WITH flags AS (
+    SELECT
+        *,
+        CAST(sales_qty AS FLOAT) / NULLIF(predicted_units, 0)   AS actual_vs_predicted
+    FROM Haleon.[10Haleon_Asda_20260801_to_20260812_Sales_Enriched]
+),
+sized AS (
+    SELECT
+        *,
+        CASE WHEN ISNULL(actual_vs_predicted, 0) < 0.5 THEN 1 ELSE 0 END AS low_sales,
+        GREATEST(ISNULL(predicted_units, 0) - sales_qty, 0)               AS lost_qty
+    FROM flags
+),
+priced AS (
+    SELECT
+        *,
+        ROUND(lost_qty * ISNULL(avg_price, 0), 2)      AS size_of_prize
+    FROM sized
+),
+classified AS (
+    SELECT
+        *,
+        CASE WHEN low_sales = 1 THEN 'Low Sales' ELSE 'No Alert' END AS alert_type,
+        CASE WHEN size_of_prize >= @hurdle_rate THEN 1 ELSE 0 END    AS hits_hurdle
+    FROM priced
+)
+SELECT
+    *,
+    CASE WHEN alert_type = 'Low Sales' AND hits_hurdle = 1 THEN 'Y' ELSE 'N' END AS alert_to_action
+INTO Haleon.[11Haleon_Asda_20260801_to_20260812_Alerts_Calc]
+FROM classified;
+GO
+
+
+SELECT * FROM Haleon.[11Haleon_Asda_20260801_to_20260812_Alerts_Calc];
+
+-- =====================================================================
+-- STEP 12: Alerts Summary
+-- =====================================================================
+-- 12a. By alert type
+DROP TABLE IF EXISTS Haleon.[12Haleon_Asda_20260801_to_20260812_Alerts_Summary_by_Type];
+
+WITH actioned AS (
+    SELECT * FROM Haleon.[11Haleon_Asda_20260801_to_20260812_Alerts_Calc] WHERE alert_to_action = 'Y'
+),
+totals AS (
+    SELECT COUNT(*) AS total_alerts FROM actioned
+)
+SELECT
+    a.alert_type,
+    COUNT(*)                                                       AS num_alerts,
+    ROUND(SUM(a.size_of_prize), 2)                                 AS size_of_prize,
+    ROUND(AVG(a.size_of_prize), 2)                                 AS avg_size_of_prize,
+    ROUND(CAST(COUNT(*) AS FLOAT) / NULLIF(t.total_alerts, 0), 4)  AS pct_alerts
+INTO Haleon.[12Haleon_Asda_20260801_to_20260812_Alerts_Summary_by_Type]
+FROM actioned AS a
+CROSS JOIN totals t
+GROUP BY a.alert_type, t.total_alerts
+
+UNION ALL
+
+SELECT
+    'Total Alerts'                             AS alert_type,
+    COUNT(*)                                   AS num_alerts,
+    ROUND(SUM(size_of_prize), 2)               AS size_of_prize,
+    ROUND(AVG(size_of_prize), 2)               AS avg_size_of_prize,
+    CAST(NULL AS FLOAT)                        AS pct_alerts
+FROM Haleon.[11Haleon_Asda_20260801_to_20260812_Alerts_Calc]
+WHERE alert_to_action = 'Y';
+GO
+
+-- 12b. By product
+DROP TABLE IF EXISTS Haleon.[12Haleon_Asda_20260801_to_20260812_Alerts_Summary_by_Product];
+
+WITH actioned AS (
+    SELECT * FROM Haleon.[11Haleon_Asda_20260801_to_20260812_Alerts_Calc] WHERE alert_to_action = 'Y'
+),
+totals AS (
+    SELECT COUNT(*) AS total_alerts FROM actioned
+)
+SELECT
+    a.article_id,
+    a.article_description,
+    COUNT(*)                                                                 AS num_alerts,
+    ROUND(SUM(a.size_of_prize), 2)                                          AS size_of_prize,
+    ROUND(AVG(a.size_of_prize), 2)                                          AS avg_size_of_prize,
+    ROUND(CAST(COUNT(*) AS FLOAT) / NULLIF(t.total_alerts, 0), 4) AS pct_alerts
+INTO Haleon.[12Haleon_Asda_20260801_to_20260812_Alerts_Summary_by_Product]
+FROM actioned a
+CROSS JOIN totals t
+GROUP BY a.article_id, a.article_description, t.total_alerts;
+GO
+
+-- =====================================================================
+-- FINAL VALIDATION
+-- =====================================================================
+
+SELECT alert_type, COUNT(*) AS num_rows
+FROM Haleon.[11Haleon_Asda_20260801_to_20260812_Alerts_Calc]
+GROUP BY alert_type
+ORDER BY num_rows DESC;
+GO
+
+SELECT * FROM Haleon.[12Haleon_Asda_20260801_to_20260812_Alerts_Summary_by_Type]
+ORDER BY size_of_prize DESC;
+GO
+
+SELECT TOP 20 *
+FROM Haleon.[12Haleon_Asda_20260801_to_20260812_Alerts_Summary_by_Product]
+ORDER BY size_of_prize DESC;
+GO
+
+SELECT * 
+FROM Haleon.[11Haleon_Asda_20260801_to_20260812_Alerts_Calc]
+WHERE store_id = 4127 AND article_id = 100107139 AND size_of_prize = 45.37;
+--XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXxxxxxxxx
+--xxxxxxxxxxxxxxxxxxxxxxxxxxx THE END xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+--XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXxxxxxxxx
+
+
+--14th August 
+-- RetailMotus Alert Load file
+--Note: 
+--Parameterised query-
+
+-- ===========================================================================
+--                  RETAILMOTUS ALERT LOAD FILE                         
+-- ===========================================================================
+
+
+
+-- ==========================================================================
+-- STEP 1: Enrich actioned alerts using RM_Load_v3 
+-- ==========================================================================
+DROP TABLE IF EXISTS Haleon.Asda_20260801_to_20260812_Alert_Load_Step1_Enriched;
+
+SELECT
+    a.store_id,
+    a.article_id,
+    a.article_description,
+    a.alert_type,
+    a.size_of_prize,
+    rm.Store_code_Asda                                                        AS trailing_code,
+    rm.Retailmotus_Item_Ref_No                                                AS item_ref_no,
+    rm.Item_ID,
+    ROW_NUMBER() OVER (PARTITION BY a.store_id ORDER BY a.size_of_prize DESC) AS rn
+INTO Haleon.Asda_20260801_to_20260812_Alert_Load_Step1_Enriched
+FROM Haleon.[11Haleon_Asda_20260801_to_20260812_Alerts_Calc] AS a
+INNER JOIN Haleon.[Haleon_Retailmotus_SKU_Mapping_Doc_v3] AS rm
+   -- ON LTRIM(RTRIM(CAST(a.article_id AS VARCHAR(50)))) = LTRIM(RTRIM(CAST(rm.Store_code_Asda AS VARCHAR(50))))
+        ON a.article_id = rm.Store_code_Asda
+    -- CONFIRMED join key: article_id = RM_Load_v2's "Store code (Asda)" column
+WHERE a.alert_to_action = 'Y';
+GO
+
+SELECT * FROM Haleon.Asda_20260801_to_20260812_Alert_Load_Step1_Enriched
+ORDER BY store_id DESC; -- To know the number of alerts in each store
+
+-- =====================================================================
+-- STEP 2: Keep only the top 5 alerts per store and build the display string
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.Asda_20260801_to_20260812_Alert_Load_Step2_Top5;
+
+SELECT
+    store_id,
+    rn,
+    article_id,
+    CAST(article_description AS NVARCHAR(200))
+        + N' - ' + CAST(alert_type AS NVARCHAR(50))
+        + N' - ' + N'£' + CAST(CAST(size_of_prize AS FLOAT) AS NVARCHAR(20))
+        + N' - ' + ISNULL(CAST(trailing_code AS NVARCHAR(50)), N'')       AS alert_string,
+    item_ref_no
+INTO Haleon.Asda_20260801_to_20260812_Alert_Load_Step2_Top5
+FROM Haleon.Asda_20260801_to_20260812_Alert_Load_Step1_Enriched
+WHERE rn <= 5;
+GO
+
+--check
+SELECT * FROM Haleon.Asda_20260801_to_20260812_Alert_Load_Step2_Top5
+ORDER BY store_id DESC;
+
+-- =====================================================================
+-- STEP 3: Pivot to one row per store (Alert1-5, ItemRefNo1-10)
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.Asda_20260801_to_20260812_Alert_Load_Step3_Pivot;
+
+SELECT
+    store_id,
+    MAX(CASE WHEN rn = 1  THEN alert_string END) AS Alert1,
+    MAX(CASE WHEN rn = 2  THEN alert_string END) AS Alert2,
+    MAX(CASE WHEN rn = 3  THEN alert_string END) AS Alert3,
+    MAX(CASE WHEN rn = 4  THEN alert_string END) AS Alert4,
+    MAX(CASE WHEN rn = 5  THEN alert_string END) AS Alert5,
+    
+    MAX(CASE WHEN rn = 1  THEN item_ref_no END)  AS ItemRefNo1,
+    MAX(CASE WHEN rn = 2  THEN item_ref_no END)  AS ItemRefNo2,
+    MAX(CASE WHEN rn = 3  THEN item_ref_no END)  AS ItemRefNo3,
+    MAX(CASE WHEN rn = 4  THEN item_ref_no END)  AS ItemRefNo4,
+    MAX(CASE WHEN rn = 5  THEN item_ref_no END)  AS ItemRefNo5
+    
+INTO Haleon.Asda_20260801_to_20260812_Alert_Load_Step3_Pivot
+FROM Haleon.Asda_20260801_to_20260812_Alert_Load_Step2_Top5
+GROUP BY store_id;
+GO
+
+SELECT * FROM Haleon.Asda_20260801_to_20260812_Alert_Load_Step3_Pivot;
+
+-- =====================================================================
+-- STEP 4: Join to store mapping for the final columns -> Asda_Alert_load_file
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.Asda_20260801_to_20260812_Alert_load_Step4_file;
+
+SELECT
+    sm.Store_Number         AS StoreCode,
+    sm.Store_ID             AS StoreId,
+    sm.Store_Group          AS [Store Group],
+    p.Alert1, p.Alert2, p.Alert3, p.Alert4, p.Alert5,
+    p.ItemRefNo1, p.ItemRefNo2, p.ItemRefNo3, p.ItemRefNo4, p.ItemRefNo5
+   
+INTO Haleon.Asda_20260801_to_20260812_Alert_load_Step4_file
+FROM Haleon.Asda_20260801_to_20260812_Alert_Load_Step3_Pivot AS p
+LEFT JOIN Haleon.[Haleon_Retailmotus_Store_Mapping(StoreList)] AS sm
+    ON p.store_id = sm.Store_Number
+WHERE Store_Group = 'Asda';
+
+GO
+select * from Haleon.Asda_20260801_to_20260812_Alert_load_Step4_file;
+
+-- Validate: any stores with alerts but no store mapping match will
+-- show NULL StoreCode/StoreId/[Store Group] here
+SELECT *
+FROM Haleon.Asda_20260801_to_20260812_Alert_load_file
+ORDER BY StoreCode;
+GO
+
+SELECT COUNT(*) AS stores_missing_mapping
+FROM Haleon.Asda_20260801_to_20260812_Alert_load_file
+WHERE StoreCode IS NULL;
+GO
