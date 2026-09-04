@@ -1,1 +1,187 @@
+-- =====================================================================
+-- CONFIG
+-- =====================================================================
+DECLARE @retailer VARCHAR(50);
+SET @retailer = 'Asda';
 
+
+-- =====================================================================
+-- STEP 1: WHICH WEEKS ARE WE SCORING?
+-- CurrentWeek_Normalized gets fully rebuilt every time the adapter
+-- runs — so whatever year_week values it holds RIGHT NOW are, by
+-- definition, exactly "the weeks just loaded." Nothing older.
+-- =====================================================================
+IF OBJECT_ID('Haleon.Weeks_To_Score', 'U') IS NOT NULL
+    DROP TABLE Haleon.Weeks_To_Score;
+
+SELECT DISTINCT year_week
+INTO Haleon.Weeks_To_Score
+FROM Haleon.CurrentWeek_Normalized;
+
+SELECT * FROM Haleon.Weeks_To_Score ORDER BY year_week;
+
+
+-- =====================================================================
+-- STEP 2: PULL THOSE WEEKS' SALES FROM HISTORY, JOIN TO EXISTING GROUPS
+-- Store groups are READ here, never recalculated.
+-- =====================================================================
+IF OBJECT_ID('Haleon.Sales_To_Score', 'U') IS NOT NULL
+    DROP TABLE Haleon.Sales_To_Score;
+
+SELECT
+    h.retailer, h.store_id, h.sku_id, h.sku_description,
+    h.year_week, h.sales_qty, h.sales_value, h.stock_qty,
+    sg.group_id
+INTO Haleon.Sales_To_Score
+FROM Haleon.Retailer_Sales_History AS h
+INNER JOIN Haleon.Weeks_To_Score AS wk
+    ON h.year_week = wk.year_week
+LEFT JOIN Haleon.[5Generic_Store_Groups] AS sg
+    ON h.retailer = sg.retailer AND h.store_id = sg.store_id
+WHERE h.retailer = @retailer;
+
+SELECT year_week, COUNT(*) AS rows_to_score
+FROM Haleon.Sales_To_Score
+GROUP BY year_week
+ORDER BY year_week;
+
+
+-- =====================================================================
+-- STEP 3: PRODUCT BENCHMARK — PER WEEK
+-- year_week is in the GROUP BY so each week's peer comparison stays
+-- separate — never blended with any other week.
+-- =====================================================================
+IF OBJECT_ID('Haleon.Product_Group_Benchmark', 'U') IS NOT NULL
+    DROP TABLE Haleon.Product_Group_Benchmark;
+
+SELECT
+    sku_id,
+    MIN(sku_description)                                                     AS sku_description,
+    group_id,
+    year_week,
+    AVG(CAST(sales_qty AS FLOAT))                                            AS predicted_units,
+    AVG(CAST(sales_value AS FLOAT)) / NULLIF(AVG(CAST(sales_qty AS FLOAT)), 0) AS avg_price
+INTO Haleon.Product_Group_Benchmark
+FROM Haleon.Sales_To_Score
+WHERE group_id IS NOT NULL
+GROUP BY sku_id, group_id, year_week;
+
+
+-- =====================================================================
+-- STEP 4: ENRICH — join back on year_week too, so each row gets ITS
+-- OWN week's benchmark, not a different week's
+-- =====================================================================
+IF OBJECT_ID('Haleon.Sales_Enriched', 'U') IS NOT NULL
+    DROP TABLE Haleon.Sales_Enriched;
+
+SELECT
+    s.retailer, s.store_id, s.sku_id, s.sku_description, s.year_week,
+    s.sales_qty, s.sales_value, s.stock_qty, s.group_id,
+    b.predicted_units, b.avg_price
+INTO Haleon.Sales_Enriched
+FROM Haleon.Sales_To_Score AS s
+LEFT JOIN Haleon.Product_Group_Benchmark AS b
+    ON s.sku_id = b.sku_id AND s.group_id = b.group_id AND s.year_week = b.year_week;
+
+
+-- =====================================================================
+-- STEP 5: ALERT CLASSIFICATION
+-- Same logic as before — stock_qty IS NOT NULL guard means stock-
+-- dependent alert types only apply to retailers that actually have
+-- stock data.
+-- =====================================================================
+DECLARE @hurdle_rate FLOAT = 10.0;
+
+IF OBJECT_ID('Haleon.Alerts_Calc_ThisRun', 'U') IS NOT NULL
+    DROP TABLE Haleon.Alerts_Calc_ThisRun;
+
+WITH flags AS (
+    SELECT *,
+        CAST(sales_qty AS FLOAT) / NULLIF(predicted_units, 0)     AS actual_vs_predicted,
+        CASE WHEN sales_qty <= 0 THEN 1 ELSE 0 END                AS zero_sales,
+        CASE WHEN stock_qty > 0 THEN 1 ELSE 0 END                 AS has_stock
+    FROM Haleon.Sales_Enriched
+),
+sized AS (
+    SELECT *,
+        CASE WHEN ISNULL(actual_vs_predicted, 0) < 0.5 THEN 1 ELSE 0 END AS low_sales,
+        CASE WHEN ISNULL(predicted_units, 0) - sales_qty > 0
+             THEN ISNULL(predicted_units, 0) - sales_qty ELSE 0 END      AS lost_qty
+    FROM flags
+),
+priced AS (
+    SELECT *, ROUND(lost_qty * ISNULL(avg_price, 0), 2) AS size_of_prize
+    FROM sized
+),
+classified AS (
+    SELECT *,
+        CASE
+            WHEN stock_qty IS NOT NULL AND zero_sales = 1 AND has_stock = 0 THEN 'Ranged not stocked'
+            WHEN stock_qty IS NOT NULL AND has_stock = 1 AND zero_sales = 1 THEN 'Stock no sales'
+            WHEN low_sales = 1                                            THEN 'Low Sales'
+            ELSE 'No Alert'
+        END                                                       AS alert_type,
+        CASE WHEN size_of_prize >= @hurdle_rate THEN 1 ELSE 0 END AS hits_hurdle
+    FROM priced
+)
+SELECT *,
+    CASE WHEN alert_type IN ('Low Sales', 'Ranged not stocked', 'Stock no sales') AND hits_hurdle = 1
+         THEN 'Y' ELSE 'N' END AS alert_to_action
+INTO Haleon.Alerts_Calc_ThisRun
+FROM classified;
+
+
+-- =====================================================================
+-- STEP 6: DELETE-THEN-REPLACE INTO THE PERSISTED ALERTS HISTORY
+-- Only the specific retailer+week combos just scored are touched.
+-- Everything else already in the table is left completely alone.
+-- Re-scoring a corrected week cleanly replaces its old alerts.
+-- =====================================================================
+IF OBJECT_ID('Haleon.Retailer_Alerts_History', 'U') IS NULL
+BEGIN
+    CREATE TABLE Haleon.Retailer_Alerts_History
+    (
+        retailer          VARCHAR(50)     NOT NULL,
+        store_id          VARCHAR(50)     NOT NULL,
+        sku_id            VARCHAR(50)     NOT NULL,
+        sku_description   NVARCHAR(200)   NULL,
+        year_week         INT             NOT NULL,
+        sales_qty         NUMERIC(18,2)   NULL,
+        sales_value       NUMERIC(18,2)   NULL,
+        stock_qty         NUMERIC(18,2)   NULL,
+        group_id          INT             NULL,
+        predicted_units   FLOAT           NULL,
+        avg_price         FLOAT           NULL,
+        actual_vs_predicted FLOAT         NULL,
+        zero_sales        INT             NULL,
+        has_stock         INT             NULL,
+        low_sales         INT             NULL,
+        lost_qty          NUMERIC(18,2)   NULL,
+        size_of_prize     NUMERIC(18,2)   NULL,
+        alert_type        VARCHAR(50)     NULL,
+        hits_hurdle       INT             NULL,
+        alert_to_action   CHAR(1)         NULL
+    );
+END;
+
+DELETE hist
+FROM Haleon.Retailer_Alerts_History AS hist
+INNER JOIN Haleon.Weeks_To_Score AS wk
+    ON hist.year_week = wk.year_week
+WHERE hist.retailer = @retailer;
+
+INSERT INTO Haleon.Retailer_Alerts_History
+SELECT * FROM Haleon.Alerts_Calc_ThisRun;
+
+
+-- =====================================================================
+-- STEP 7: VALIDATION
+-- =====================================================================
+SELECT
+    year_week, alert_type, COUNT(*) AS num_rows,
+    SUM(CASE WHEN alert_to_action = 'Y' THEN 1 ELSE 0 END) AS num_actioned
+FROM Haleon.Retailer_Alerts_History
+WHERE retailer = @retailer
+  AND year_week IN (SELECT year_week FROM Haleon.Weeks_To_Score)
+GROUP BY year_week, alert_type
+ORDER BY year_week, num_rows DESC;
