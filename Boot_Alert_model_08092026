@@ -177,6 +177,23 @@ GROUP BY store_id,
     week_commencing;
 GO
 
+-- Validation check:
+SELECT
+    COUNT(*)                        AS rows_num,
+    COUNT(DISTINCT store_id)        AS distinct_stores,
+    COUNT(DISTINCT year_week)       AS distinct_weeks,
+    SUM(weekly_sales_qty)           AS total_qty,
+    SUM(weekly_skus_selling)        AS total_skus_selling
+FROM Haleon.[3Haleon_Boots_History_Store_by_Week];
+GO
+
+-- Cross-check: total_qty here should match total_qty from Step 2's
+-- validation exactly — this step only rolls up, never re-aggregates
+-- sales, so the two totals must agree.
+SELECT SUM(sales_qty) AS total_qty_step2
+FROM Haleon.[2Haleon_Boots_History_Weekly];
+GO
+
 -- =====================================================================
 -- STEP 4: Average weekly performance by store, over YOUR chosen analysis window
 -- =====================================================================
@@ -211,6 +228,20 @@ SELECT
     avg_skus_selling_per_week,
     NTILE(@num_groups) OVER (ORDER BY avg_qty_by_week DESC) AS group_id
 INTO Haleon.[5Haleon_Boots_Store_Groups]
+FROM Haleon.[4Haleon_Boots_History_Avg_Sales_Store_by_Wk];
+GO
+
+
+-- Validation check:
+SELECT
+    COUNT(*)                                                AS total_stores,
+    MIN(avg_qty_by_week)                                    AS minimum_avg_weekly_qty,
+    MAX(avg_qty_by_week)                                    AS maximum_avg_weekly_qty,
+    AVG(avg_qty_by_week)                                    AS overall_avg_weekly_qty,
+    SUM(CASE WHEN weeks_available = DATEDIFF(WEEK, @history_start_date, @history_end_date) + 1
+             THEN 1 ELSE 0 END)                             AS stores_with_full_history,
+    SUM(CASE WHEN weeks_available < DATEDIFF(WEEK, @history_start_date, @history_end_date) + 1
+             THEN 1 ELSE 0 END)                              AS stores_with_incomplete_history
 FROM Haleon.[4Haleon_Boots_History_Avg_Sales_Store_by_Wk];
 GO
 
