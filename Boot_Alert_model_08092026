@@ -1,0 +1,462 @@
+--DATE: [fill in]
+--Boots Predict Alert — Interim T-SQL script
+--Adapted from: Asda interim build (daily grain -> weekly aggregation,
+--              store peer-grouping via NTILE) +
+--              Tesco build (stock-aware alert classification:
+--              Low Sales / Stock No Sales / Ranged Not Stocked)
+--
+--Boots-specific handling added in this script:
+--  1. Product column arrives as "<Article_ID> - <Description>" combined
+--     -> split on the FIRST " - " occurrence
+--  2. Total_Sales_Amount_per_Store / Total_Sales_Volume_per_Store_Units
+--     arrive as VARCHAR with literal string 'NA' mixed in with numerics
+--     -> 'NA' is converted to NULL (not 0) — CHANGE IF YOU WANT 0 INSTEAD
+--  3. Store_On_Hand_Volume_Units = Boots' stock field, equivalent to
+--     Tesco's Stock Volume TY (NOT the same concept as ASDA's history,
+--     which had no stock data at all)
+--  4. Data is DAILY grain (like Asda), so needs Week_Commencing /
+--     Year_Week_Number derivation and daily->weekly aggregation
+--     (Tesco's raw data arrived pre-aggregated to weekly, so its
+--     Step 6b only filtered — Boots needs to aggregate, like Asda did)
+--
+--ASSUMPTIONS TO CONFIRM / ADJUST:
+--  - Raw landing table name: Haleon.Boots_Sales_Raw
+--    (columns: Calendar, Store_Id, Product, Total_Sales_Amount_per_Store,
+--     Total_Sales_Volume_per_Store_Units, Store_On_Hand_Volume_Units)
+--  - Stock is AVERAGED across the week per store x article (a snapshot
+--    value, not additive) — change to MAX/last-day if you'd rather
+--  - @num_groups = 10 (matches Asda; Tesco used 20 — depends on Boots'
+--    actual store count)
+--  - ranged_flag hardcoded to 1 everywhere, same placeholder Tesco used
+--    (no range/planogram source available for either retailer yet)
+--  - GREATEST() and ANY_VALUE() need SQL Server 2022 compat level 160.
+--    Fallback equivalents are commented next to each in case your
+--    instance is still on a lower compat level (per earlier ASDA work).
+
+-- =====================================================================
+-- STEP 0: Normalize the historical raw landing table
+--         (split Product, clean 'NA', derive week fields)
+-- =====================================================================
+DECLARE @load_start_date DATE = '2026-06-01';   -- <-- ADJUST: history window start
+
+DROP TABLE IF EXISTS Haleon.Boots_Sales_History_Normalized;
+
+SELECT
+    [Store_Id]                                                       AS store_id,
+    LTRIM(RTRIM(LEFT([Product], CHARINDEX(' - ', [Product]) - 1)))   AS article_id,
+    LTRIM(RTRIM(SUBSTRING([Product], CHARINDEX(' - ', [Product]) + 3, 4000)))
+                                                                      AS article_description,
+    TRY_CAST(NULLIF([Total_Sales_Amount_per_Store], 'NA') AS NUMERIC(18,2))
+                                                                      AS sales_value,
+    TRY_CAST(NULLIF([Total_Sales_Volume_per_Store_Units], 'NA') AS INT)
+                                                                      AS sales_qty,
+    TRY_CAST(NULLIF([Store_On_Hand_Volume_Units], 'NA') AS INT)      AS stock_volume,
+    CAST([Calendar] AS DATE)                                         AS sale_date,
+    CAST(
+        DATEADD(
+            DAY,
+            -(DATEDIFF(DAY, '19000101', CAST([Calendar] AS DATE)) % 7),
+            CAST([Calendar] AS DATE)
+        ) AS DATE
+    )                                                                 AS week_commencing,
+    YEAR(
+        DATEADD(
+            DAY,
+            3 - (DATEDIFF(DAY, '19000101', CAST([Calendar] AS DATE)) % 7),
+            CAST([Calendar] AS DATE)
+        )
+    ) * 100
+    + DATEPART(ISO_WEEK, CAST([Calendar] AS DATE))                    AS year_week
+INTO Haleon.Boots_Sales_History_Normalized
+FROM Haleon.Boots_Sales_Raw
+WHERE CAST([Calendar] AS DATE) >= @load_start_date;
+GO
+
+-- Validate
+SELECT
+    COUNT(*)                            AS total_rows,
+    COUNT(DISTINCT article_id)          AS distinct_articles,
+    COUNT(DISTINCT store_id)            AS distinct_stores,
+    COUNT(DISTINCT year_week)           AS distinct_weeks,
+    SUM(CASE WHEN sales_value IS NULL THEN 1 ELSE 0 END) AS null_sales_value_rows,
+    SUM(CASE WHEN sales_qty IS NULL THEN 1 ELSE 0 END)   AS null_sales_qty_rows
+FROM Haleon.Boots_Sales_History_Normalized;
+GO
+
+
+-- =====================================================================
+-- STEP 1: Aggregate daily rows to Article x Store x Week (history)
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.[1Haleon_Boots_History_Weekly];
+
+SELECT
+    article_id,
+    MAX(article_description)                                    AS article_description,
+    -- ^ MAX() as an ANY_VALUE() substitute — description is
+    --   functionally dependent on article_id, so MAX is safe here.
+    --   Swap for ANY_VALUE(article_description) if compat level allows.
+    store_id,
+    year_week,
+    week_commencing,
+    SUM(sales_value)                                             AS sales_value,
+    SUM(sales_qty)                                               AS sales_qty,
+    AVG(CAST(stock_volume AS FLOAT))                             AS stock_volume,
+    CASE WHEN SUM(sales_value) > 0 THEN 1 ELSE 0 END             AS skus_selling
+INTO Haleon.[1Haleon_Boots_History_Weekly]
+FROM Haleon.Boots_Sales_History_Normalized
+GROUP BY article_id, store_id, year_week, week_commencing;
+GO
+
+-- Validation check
+SELECT
+    COUNT(*)                       AS aggregated_rows,
+    COUNT(DISTINCT article_id)     AS distinct_articles,
+    COUNT(DISTINCT store_id)       AS distinct_stores,
+    COUNT(DISTINCT year_week)      AS distinct_weeks,
+    SUM(sales_qty)                 AS total_qty,
+    CAST(ROUND(SUM(sales_value), 2) AS NUMERIC(18,2)) AS total_value
+FROM Haleon.[1Haleon_Boots_History_Weekly];
+GO
+
+
+-- =====================================================================
+-- STEP 2: Roll up to Store x Week
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.[2Haleon_Boots_History_Store_by_Week];
+
+SELECT
+    store_id,
+    year_week,
+    week_commencing,
+    SUM(sales_qty)      AS weekly_sales_qty,
+    SUM(skus_selling)   AS weekly_skus_selling
+INTO Haleon.[2Haleon_Boots_History_Store_by_Week]
+FROM Haleon.[1Haleon_Boots_History_Weekly]
+GROUP BY store_id, year_week, week_commencing;
+GO
+
+
+-- =====================================================================
+-- STEP 3: Average weekly performance by store, over the history window
+-- =====================================================================
+DECLARE @history_start_date DATE = '2026-06-01';   -- <-- keep in sync with Step 0
+DECLARE @history_end_date   DATE = '2026-07-27';   -- <-- ADJUST
+
+DROP TABLE IF EXISTS Haleon.[3Haleon_Boots_Avg_Sales_Store_by_Wk];
+
+SELECT
+    store_id,
+    AVG(CAST(weekly_sales_qty AS FLOAT))               AS avg_qty_by_week,
+    AVG(CAST(weekly_skus_selling AS FLOAT))            AS avg_skus_selling_per_week,
+    COUNT(DISTINCT year_week)                          AS weeks_available
+INTO Haleon.[3Haleon_Boots_Avg_Sales_Store_by_Wk]
+FROM Haleon.[2Haleon_Boots_History_Store_by_Week]
+WHERE week_commencing BETWEEN @history_start_date AND @history_end_date
+GROUP BY store_id;
+GO
+
+
+-- =====================================================================
+-- STEP 4: Assign each store to a peer group (NTILE)
+-- =====================================================================
+DECLARE @num_groups INT = 10;  -- <-- ADJUST based on Boots' actual store count
+
+DROP TABLE IF EXISTS Haleon.[4Haleon_Boots_Store_Groups];
+
+SELECT
+    store_id,
+    avg_qty_by_week,
+    avg_skus_selling_per_week,
+    NTILE(@num_groups) OVER (ORDER BY avg_qty_by_week DESC) AS group_id
+INTO Haleon.[4Haleon_Boots_Store_Groups]
+FROM Haleon.[3Haleon_Boots_Avg_Sales_Store_by_Wk];
+GO
+
+-- Validate
+SELECT group_id, COUNT(*) AS num_stores
+FROM Haleon.[4Haleon_Boots_Store_Groups]
+GROUP BY group_id
+ORDER BY group_id;
+GO
+
+
+-- #######################################################################
+-- ##                        END OF HISTORY BLOCK                      ##
+-- #######################################################################
+
+
+-- #######################################################################
+-- ##  CURRENT WEEK SCORING — score a new Boots file the same way
+-- #######################################################################
+
+-- =====================================================================
+-- STEP 5: Normalize this week's landing table
+--         (same split/clean logic as Step 0, applied to the new file)
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.Boots_CurrentWeek_Normalized;
+
+SELECT
+    [Store_Id]                                                       AS store_id,
+    LTRIM(RTRIM(LEFT([Product], CHARINDEX(' - ', [Product]) - 1)))   AS article_id,
+    LTRIM(RTRIM(SUBSTRING([Product], CHARINDEX(' - ', [Product]) + 3, 4000)))
+                                                                      AS article_description,
+    TRY_CAST(NULLIF([Total_Sales_Amount_per_Store], 'NA') AS NUMERIC(18,2))
+                                                                      AS sales_value,
+    TRY_CAST(NULLIF([Total_Sales_Volume_per_Store_Units], 'NA') AS INT)
+                                                                      AS sales_qty,
+    TRY_CAST(NULLIF([Store_On_Hand_Volume_Units], 'NA') AS INT)      AS stock_volume,
+    CAST([Calendar] AS DATE)                                         AS sale_date,
+    CAST(
+        DATEADD(
+            DAY,
+            -(DATEDIFF(DAY, '19000101', CAST([Calendar] AS DATE)) % 7),
+            CAST([Calendar] AS DATE)
+        ) AS DATE
+    )                                                                 AS week_commencing,
+    YEAR(
+        DATEADD(
+            DAY,
+            3 - (DATEDIFF(DAY, '19000101', CAST([Calendar] AS DATE)) % 7),
+            CAST([Calendar] AS DATE)
+        )
+    ) * 100
+    + DATEPART(ISO_WEEK, CAST([Calendar] AS DATE))                    AS year_week
+INTO Haleon.Boots_CurrentWeek_Normalized
+FROM Haleon.Boots_Sales_CurrentWeek_Raw;   -- <-- point at whichever new file you load
+GO
+
+
+-- =====================================================================
+-- STEP 6: Aggregate this week's daily rows to Article x Store x Week
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.[6Haleon_Boots_CurrentWeek_Weekly];
+
+SELECT
+    article_id,
+    MAX(article_description)                     AS article_description,
+    store_id,
+    year_week,
+    week_commencing,
+    SUM(sales_value)                              AS sales_value,
+    SUM(sales_qty)                                AS sales_qty,
+    AVG(CAST(stock_volume AS FLOAT))              AS stock_volume
+INTO Haleon.[6Haleon_Boots_CurrentWeek_Weekly]
+FROM Haleon.Boots_CurrentWeek_Normalized
+GROUP BY article_id, store_id, year_week, week_commencing;
+GO
+
+
+-- =====================================================================
+-- STEP 7: Join to store groups + safety check against the history window
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.[7Haleon_Boots_CurrentWeek_with_Group];
+
+SELECT
+    s.article_id,
+    s.article_description,
+    s.store_id,
+    s.year_week,
+    s.week_commencing,
+    s.sales_value,
+    s.sales_qty,
+    s.stock_volume,
+    sg.group_id
+INTO Haleon.[7Haleon_Boots_CurrentWeek_with_Group]
+FROM Haleon.[6Haleon_Boots_CurrentWeek_Weekly] AS s
+LEFT JOIN Haleon.[4Haleon_Boots_Store_Groups] AS sg
+    ON s.store_id = sg.store_id;
+GO
+
+-- Safety check: scored week should be AFTER the history window used for grouping
+DECLARE @scored_week_commencing DATE =
+    (SELECT MIN(week_commencing) FROM Haleon.[7Haleon_Boots_CurrentWeek_with_Group]);
+DECLARE @history_end_date_check DATE = '2026-07-27';  -- keep in sync with Step 3
+
+SELECT
+    @scored_week_commencing   AS scored_week_commencing,
+    @history_end_date_check   AS history_end_date,
+    CASE
+        WHEN @scored_week_commencing <= @history_end_date_check
+        THEN 'WARNING: scored week overlaps the history window — check your dates'
+        ELSE 'OK: scored week is after the history window'
+    END AS overlap_check;
+GO
+
+
+-- =====================================================================
+-- STEP 8: Product benchmark — peer comparison within the current week
+--         (includes ranged_flag placeholder, same as Tesco)
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.[8Haleon_Boots_Product_Group_Benchmark];
+
+SELECT
+    article_id,
+    MAX(article_description)                                                          AS article_description,
+    group_id,
+    AVG(CAST(sales_qty AS FLOAT))                                                      AS predicted_units,
+    AVG(CAST(sales_value AS FLOAT)) / NULLIF(AVG(CAST(sales_qty AS FLOAT)), 0)        AS avg_price,
+    1                                                                                   AS ranged_flag
+    -- PLACEHOLDER — hardcoded to 1 for every row, same as Tesco.
+    -- Replace with real range/planogram logic if a source ever becomes available.
+INTO Haleon.[8Haleon_Boots_Product_Group_Benchmark]
+FROM Haleon.[7Haleon_Boots_CurrentWeek_with_Group]
+WHERE group_id IS NOT NULL
+GROUP BY article_id, group_id;
+GO
+
+
+-- =====================================================================
+-- STEP 9: Enrich current week's sales with the benchmark
+-- =====================================================================
+DROP TABLE IF EXISTS Haleon.[9Haleon_Boots_Sales_Enriched];
+
+SELECT
+    s.article_id,
+    s.article_description,
+    s.store_id,
+    s.year_week,
+    s.week_commencing,
+    s.sales_value,
+    s.sales_qty,
+    s.stock_volume,
+    s.group_id,
+    b.predicted_units,
+    b.avg_price,
+    b.ranged_flag AS ranged
+INTO Haleon.[9Haleon_Boots_Sales_Enriched]
+FROM Haleon.[7Haleon_Boots_CurrentWeek_with_Group] AS s
+LEFT JOIN Haleon.[8Haleon_Boots_Product_Group_Benchmark] AS b
+    ON s.article_id = b.article_id AND s.group_id = b.group_id;
+GO
+
+
+-- =====================================================================
+-- STEP 10: Flag / classify / price alerts
+--          (stock-aware — full Low Sales / Stock No Sales /
+--           Ranged Not Stocked logic, same as Tesco, since Boots
+--           has stock data unlike the original Asda interim build)
+-- =====================================================================
+DECLARE @hurdle_rate FLOAT = 10.0;
+
+DROP TABLE IF EXISTS Haleon.[10Haleon_Boots_Alerts_Calc];
+
+WITH flags AS (
+    SELECT
+        *,
+        CAST(sales_qty AS FLOAT) / NULLIF(predicted_units, 0)   AS actual_vs_predicted,
+        CASE WHEN ISNULL(sales_qty, 0) <= 0 THEN 1 ELSE 0 END   AS zero_sales,
+        CASE WHEN ISNULL(stock_volume, 0) > 0 THEN 1 ELSE 0 END AS has_stock
+    FROM Haleon.[9Haleon_Boots_Sales_Enriched]
+),
+sized AS (
+    SELECT
+        *,
+        CASE WHEN ISNULL(actual_vs_predicted, 0) < 0.5 THEN 1 ELSE 0 END AS low_sales,
+        CASE
+            WHEN ISNULL(predicted_units, 0) - ISNULL(sales_qty, 0) > 0
+            THEN ISNULL(predicted_units, 0) - ISNULL(sales_qty, 0)
+            ELSE 0
+        END                                                               AS lost_qty
+        -- ^ CASE-based equivalent of GREATEST(predicted_units - sales_qty, 0)
+        --   Swap back to GREATEST() if your instance supports compat level 160.
+    FROM flags
+),
+priced AS (
+    SELECT
+        *,
+        ROUND(lost_qty * ISNULL(avg_price, 0), 2)      AS size_of_prize
+    FROM sized
+),
+classified AS (
+    SELECT
+        *,
+        CASE
+            WHEN ranged = 1 AND has_stock = 0     THEN 'Ranged Not Stocked'
+            WHEN has_stock = 1 AND zero_sales = 1 THEN 'Stock No Sales'
+            WHEN low_sales = 1                     THEN 'Low Sales'
+            ELSE 'No Alert'
+        END                                                              AS alert_type,
+        CASE WHEN size_of_prize >= @hurdle_rate THEN 1 ELSE 0 END        AS hits_hurdle
+    FROM priced
+)
+SELECT
+    *,
+    CASE
+        WHEN alert_type IN ('Low Sales', 'Ranged Not Stocked', 'Stock No Sales')
+             AND hits_hurdle = 1 THEN 'Y'
+        ELSE 'N'
+    END AS alert_to_action
+INTO Haleon.[10Haleon_Boots_Alerts_Calc]
+FROM classified;
+GO
+
+SELECT * FROM Haleon.[10Haleon_Boots_Alerts_Calc];
+GO
+
+
+-- =====================================================================
+-- STEP 11: Alerts Summary
+-- =====================================================================
+-- 11a. By alert type
+DROP TABLE IF EXISTS Haleon.[11Haleon_Boots_Alerts_Summary_by_Type];
+
+WITH actioned AS (
+    SELECT * FROM Haleon.[10Haleon_Boots_Alerts_Calc] WHERE alert_to_action = 'Y'
+),
+totals AS (
+    SELECT COUNT(*) AS total_alerts FROM actioned
+)
+SELECT
+    a.alert_type,
+    COUNT(*)                                                       AS num_alerts,
+    ROUND(SUM(a.size_of_prize), 2)                                 AS size_of_prize,
+    ROUND(AVG(a.size_of_prize), 2)                                 AS avg_size_of_prize,
+    ROUND(CAST(COUNT(*) AS FLOAT) / NULLIF(t.total_alerts, 0), 4)  AS pct_alerts
+INTO Haleon.[11Haleon_Boots_Alerts_Summary_by_Type]
+FROM actioned AS a
+CROSS JOIN totals t
+GROUP BY a.alert_type, t.total_alerts
+
+UNION ALL
+
+SELECT
+    'Total Alerts'                             AS alert_type,
+    COUNT(*)                                   AS num_alerts,
+    ROUND(SUM(size_of_prize), 2)               AS size_of_prize,
+    ROUND(AVG(size_of_prize), 2)               AS avg_size_of_prize,
+    CAST(NULL AS FLOAT)                        AS pct_alerts
+FROM Haleon.[10Haleon_Boots_Alerts_Calc]
+WHERE alert_to_action = 'Y';
+GO
+
+SELECT * FROM Haleon.[11Haleon_Boots_Alerts_Summary_by_Type]
+ORDER BY size_of_prize DESC;
+GO
+
+
+-- 11b. By product
+DROP TABLE IF EXISTS Haleon.[11Haleon_Boots_Alerts_Summary_by_Product];
+
+WITH actioned AS (
+    SELECT * FROM Haleon.[10Haleon_Boots_Alerts_Calc] WHERE alert_to_action = 'Y'
+),
+totals AS (
+    SELECT COUNT(*) AS total_alerts FROM actioned
+)
+SELECT
+    a.article_id,
+    MAX(a.article_description)                                              AS article_description,
+    COUNT(*)                                                                 AS num_alerts,
+    ROUND(SUM(a.size_of_prize), 2)                                          AS size_of_prize,
+    ROUND(AVG(a.size_of_prize), 2)                                          AS avg_size_of_prize,
+    ROUND(CAST(COUNT(*) AS FLOAT) / NULLIF(MAX(t.total_alerts), 0), 4)     AS pct_alerts
+INTO Haleon.[11Haleon_Boots_Alerts_Summary_by_Product]
+FROM actioned a
+CROSS JOIN totals t
+GROUP BY a.article_id;
+GO
+
+SELECT TOP 20 *
+FROM Haleon.[11Haleon_Boots_Alerts_Summary_by_Product]
+ORDER BY size_of_prize DESC;
+GO
