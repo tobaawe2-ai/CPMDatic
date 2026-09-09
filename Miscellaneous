@@ -1,3 +1,19 @@
+Boots epos sample data:
+Calendar	Store_Id	Product	Total_Sales_Amount_per_Store	Total_Sales_Volume_per_Store_Units	Store_On_Hand_Volume_Units
+2026-11-07	6045	1762745 - Sensodyne Clinical White Enamel Strength	0	0	4
+2026-11-07	5572	5979986 - Nexium control 20mg 14s G	0	0	3
+2026-11-07	6200	2508672 - NIGHT NURSE LIQUID 160ML 6+ (P) (1E)	10.99	1	2
+2026-11-07	5304	9199152 - Volt ONE A DAY Muscle140mg MedPlas 5 (G)	NA	NA	3
+2026-11-07	5427	3565610 - Piriteze allergy syrup 2 years+ 70ml (P)	0	0	2
+2026-11-07	5863	6037941 - Voltarol 12 hour gel 100g (P)	0	2	2
+2026-11-07	5974	5691095 - Centrum Advance 50+ 100	NA	NA	2
+2026-11-07	5726	3081664 - PIRITON 60S TABLETS (P)	10.5	1	5
+2026-11-07	6045	3745856 - Pronamel active shield whitening tp 75ml	11.5	2	11
+2026-11-07	5572	7931344 - Nexium Control capsules 14s G	14.5	1	1
+
+
+
+
 
 article_id	article_description	store_id	site_name	year_week	week_commencing	sales_value	sales_qty
 100105182	BEECHAMS ALL IN ONE LIQUID 160ML	4001	EXPPFS CHORLEY	202632	2026-08-03	4.58	1
