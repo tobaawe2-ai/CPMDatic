@@ -1,0 +1,480 @@
+--4th August 2026
+--Authour: TA
+-- Predict Alert Testing Script using Asda data June for 2026
+
+-- =====================================================================
+-- STEP 0: Normalize column names, then validate
+-- =====================================================================
+IF OBJECT_ID('Haleon.Haleon_Tesco_Raw_Data_staging', 'U') IS NOT NULL
+    DROP TABLE Haleon.Haleon_Tesco_Raw_Data_staging;
+ 
+SELECT
+    [TPNB]                AS tpnb,
+    [TPNB Description]    AS tpnb_description,
+    [Store ID]            AS store_id,
+    [Year Week Number]    AS year_week,
+    [Sales Value TY]      AS sales_value_ty,
+    [Sales Volume TY]     AS sales_volume_ty,
+    [Stock Volume TY]     AS stock_volume_ty,
+    [SKUs Selling]        AS skus_selling
+INTO Haleon.Haleon_Tesco_Raw_Data_staging
+FROM Haleon.Haleon_Tesco_Raw_Data;
+ 
+DROP TABLE Haleon.Haleon_Tesco_Raw_Data;
+EXEC sp_rename 'Haleon.Haleon_Tesco_Raw_Data_staging', 'Haleon_Tesco_Raw_Data';
+ 
+-- NOTE: exactly as in the BigQuery version, this step only works as
+-- written the FIRST time (while the table still has the original
+-- Excel-style column names). If you ever reload fresh raw data, load
+-- it into a differently-named table first, then repeat this
+-- normalization step separately into Haleon_Tesco_Raw_Data.
+ 
+ 
+-- Validate
+SELECT
+    COUNT(*)                                                  AS total_rows,
+    COUNT(DISTINCT tpnb)                                      AS distinct_tpnb,
+    COUNT(DISTINCT store_id)                                  AS distinct_stores,
+    COUNT(DISTINCT year_week)                                 AS distinct_weeks,
+    (
+        SELECT STRING_AGG(CAST(w AS VARCHAR(20)), ', ') WITHIN GROUP (ORDER BY w)
+        FROM (SELECT DISTINCT year_week AS w FROM Haleon.Haleon_Tesco_Raw_Data) AS d
+    )                                                          AS weeks_present,
+    COUNT(*) - COUNT(DISTINCT CONCAT(CAST(tpnb AS VARCHAR(20)), '-', CAST(store_id AS VARCHAR(20)), '-', CAST(year_week AS VARCHAR(20))))
+                                                               AS duplicate_key_rows,
+    SUM(CASE WHEN tpnb_description IS NULL THEN 1 ELSE 0 END) AS null_descriptions
+FROM Haleon.Haleon_Tesco_Raw_Data;
+ 
+ 
+-- =====================================================================
+-- STEP 1: Deduplicate the HISTORICAL raw data to unique TPNB x Store x Week
+-- =====================================================================
+-- This dedup IS correct here — this table is the 4-week historical
+-- file used to build Store Grouping, where duplicate keys genuinely
+-- need summing to produce accurate averages. (Do not apply this same
+-- pattern to the current-week scoring table — see Step 6b below.)
+-- =====================================================================
+IF OBJECT_ID('Haleon.1Haleon_Tesco_Sales', 'U') IS NOT NULL
+    DROP TABLE Haleon.[1Haleon_Tesco_Sales];
+ 
+SELECT
+    tpnb,
+    ANY_VALUE(tpnb_description)                         AS tpnb_description,
+    store_id,
+    year_week,
+    SUM(sales_value_ty)                                  AS sales_value_ty,
+    SUM(sales_volume_ty)                                 AS sales_volume_ty,
+    SUM(stock_volume_ty)                                 AS stock_volume_ty,
+    CASE WHEN SUM(sales_value_ty) > 0 THEN 1 ELSE 0 END  AS skus_selling
+INTO Haleon.[1Haleon_Tesco_Sales]
+FROM Haleon.Haleon_Tesco_Raw_Data
+GROUP BY tpnb, store_id, year_week;
+ 
+ 
+-- Validate
+-- Expected: deduped_rows = 667,219 | distinct_tpnb = 251 |
+-- distinct_stores = 3,495 | distinct_weeks = 4 |
+-- total_volume = 3,103,785 | total_value = 11,538,366.54
+SELECT
+    COUNT(*)                                              AS deduped_rows,
+    COUNT(DISTINCT tpnb)                                  AS distinct_tpnb,
+    COUNT(DISTINCT store_id)                              AS distinct_stores,
+    COUNT(DISTINCT year_week)                             AS distinct_weeks,
+    SUM(sales_volume_ty)                                  AS total_volume,
+    CAST(ROUND(SUM(sales_value_ty), 2) AS NUMERIC(18,2))  AS total_value
+FROM Haleon.[1Haleon_Tesco_Sales];
+ 
+ 
+-- Cross-check: totals should be IDENTICAL to the raw table's totals
+SELECT
+    SUM(sales_volume_ty)                                  AS total_volume,
+    CAST(ROUND(SUM(sales_value_ty), 2) AS NUMERIC(18,2))  AS total_value
+FROM Haleon.Haleon_Tesco_Raw_Data;
+ 
+ 
+-- =====================================================================
+-- STEP 2: Roll up to Store x Week
+-- =====================================================================
+IF OBJECT_ID('Haleon.2Haleon_Tesco_Sales_store_by_week', 'U') IS NOT NULL
+    DROP TABLE Haleon.[2Haleon_Tesco_Sales_store_by_week];
+ 
+SELECT
+    store_id,
+    year_week,
+    SUM(sales_volume_ty)  AS weekly_sales_volume,
+    SUM(skus_selling)     AS weekly_skus_selling
+INTO Haleon.[2Haleon_Tesco_Sales_store_by_week]
+FROM Haleon.[1Haleon_Tesco_Sales]
+GROUP BY store_id, year_week;
+ 
+ 
+-- Validate
+-- Expected: rows = 13,970 | distinct_stores = 3,495 | distinct_weeks = 4 |
+-- total_volume = 3,103,785
+SELECT COUNT(*) AS rows_cnt,
+       COUNT(DISTINCT store_id) AS distinct_stores,
+       COUNT(DISTINCT year_week) AS distinct_weeks,
+       SUM(weekly_sales_volume) AS total_volume
+FROM   Haleon.[2Haleon_Tesco_Sales_store_by_week];
+ 
+-- Spot check: store 5998 — expected volumes 3094 / 3095 / 3050 / 2740
+SELECT *
+FROM Haleon.[2Haleon_Tesco_Sales_store_by_week]
+WHERE store_id = 5998
+ORDER BY year_week;
+ 
+ 
+-- =====================================================================
+-- STEP 3: Calculate average weekly performance by store
+-- Excel equivalent: "Avg by Store" sheet
+-- =====================================================================
+IF OBJECT_ID('Haleon.3Haleon_Tesco_Avg_Sales_Store_by_Wk', 'U') IS NOT NULL
+    DROP TABLE Haleon.[3Haleon_Tesco_Avg_Sales_Store_by_Wk];
+ 
+SELECT
+    store_id AS store_number,
+    AVG(CAST(weekly_sales_volume AS FLOAT))  AS avg_volume_by_week,
+    AVG(CAST(weekly_skus_selling AS FLOAT))  AS avg_skus_selling_per_week,
+    COUNT(DISTINCT year_week)                AS weeks_available
+INTO Haleon.[3Haleon_Tesco_Avg_Sales_Store_by_Wk]
+FROM Haleon.[2Haleon_Tesco_Sales_store_by_week]
+GROUP BY store_id;
+ 
+ 
+-- Validate
+SELECT
+    COUNT(*)                                                        AS total_stores,
+    MIN(avg_volume_by_week)                                         AS minimum_avg_weekly_volume,
+    MAX(avg_volume_by_week)                                         AS maximum_avg_weekly_volume,
+    AVG(avg_volume_by_week)                                         AS overall_avg_weekly_volume,
+    SUM(CASE WHEN weeks_available = 4 THEN 1 ELSE 0 END)            AS stores_with_4_weeks,
+    SUM(CASE WHEN weeks_available < 4 THEN 1 ELSE 0 END)            AS stores_with_incomplete_history
+FROM Haleon.[3Haleon_Tesco_Avg_Sales_Store_by_Wk];
+ 
+ 
+-- View the highest-volume stores
+SELECT TOP 20
+    store_number,
+    avg_volume_by_week,
+    avg_skus_selling_per_week,
+    weeks_available
+FROM Haleon.[3Haleon_Tesco_Avg_Sales_Store_by_Wk]
+ORDER BY avg_volume_by_week DESC, store_number ASC;
+ 
+ 
+-- =====================================================================
+-- STEP 4: Assign each store to a group
+-- =====================================================================
+DECLARE @num_groups INT = 20;
+ 
+IF OBJECT_ID('Haleon.4Haleon_Tesco_Store_Groups', 'U') IS NOT NULL
+    DROP TABLE Haleon.[4Haleon_Tesco_Store_Groups];
+ 
+SELECT
+    store_number,
+    avg_volume_by_week,
+    avg_skus_selling_per_week,
+    NTILE(@num_groups) OVER (ORDER BY avg_volume_by_week DESC) AS group_id
+INTO Haleon.[4Haleon_Tesco_Store_Groups]
+FROM Haleon.[3Haleon_Tesco_Avg_Sales_Store_by_Wk];
+ 
+ 
+-- Validate
+SELECT
+    group_id,
+    COUNT(*) AS num_stores
+FROM Haleon.[4Haleon_Tesco_Store_Groups]
+GROUP BY group_id
+ORDER BY group_id;
+ 
+ 
+-- Spot check: store 5998 (busiest store) should land in Group 1
+SELECT *
+FROM Haleon.[4Haleon_Tesco_Store_Groups]
+WHERE store_number = 5998;
+ 
+ 
+-- Confirm all stores received exactly one valid group
+SELECT
+    COUNT(*)                                                          AS total_rows,
+    COUNT(DISTINCT store_number)                                      AS distinct_stores,
+    SUM(CASE WHEN group_id IS NULL THEN 1 ELSE 0 END)                 AS null_store_groups,
+    SUM(CASE WHEN group_id < 1 OR group_id > 20 THEN 1 ELSE 0 END)    AS invalid_store_groups
+FROM Haleon.[4Haleon_Tesco_Store_Groups];
+ 
+ 
+SELECT
+    group_id,
+    COUNT(*)                   AS stores_in_group,
+    MIN(avg_volume_by_week)    AS minimum_avg_volume,
+    MAX(avg_volume_by_week)    AS maximum_avg_volume,
+    AVG(avg_volume_by_week)    AS group_avg_volume
+FROM Haleon.[4Haleon_Tesco_Store_Groups]
+GROUP BY group_id
+ORDER BY group_id;
+ 
+ 
+-- =====================================================================
+-- STEP 6b: Filter to the current week (NO dedup/aggregation)
+-- =====================================================================
+-- IMPORTANT: unlike Step 1 (the historical file, where duplicate keys
+-- genuinely needed SUMming), the current week's file is scored
+-- row-by-row, exactly as-is — duplicate tpnb+store+week rows are NOT
+-- summed together. This step must only filter, never aggregate.
+-- =====================================================================
+DECLARE @current_week INT = 202613;  -- set this to whichever week you're scoring
+ 
+IF OBJECT_ID('Haleon.6bHaleon_Tesco_Current_Week_Sales', 'U') IS NOT NULL
+    DROP TABLE Haleon.[6bHaleon_Tesco_Current_Week_Sales];
+ 
+SELECT
+    tpnb,
+    tpnb_description,
+    store_id,
+    year_week,
+    sales_value_ty,
+    sales_volume_ty,
+    stock_volume_ty
+INTO Haleon.[6bHaleon_Tesco_Current_Week_Sales]
+FROM Haleon.Haleon_Tesco_week2016_wk13_raw_data
+WHERE year_week = @current_week;
+ 
+ 
+-- Validate
+-- Expected: 209,798 rows (must match the raw table's row count for
+-- this week exactly — this step only filters, never aggregates)
+SELECT COUNT(*) AS rows_num
+FROM Haleon.[6bHaleon_Tesco_Current_Week_Sales];
+ 
+ 
+-- =====================================================================
+-- STEP 5: Product benchmark — calculated from the CURRENT WEEK's own
+-- sales (peer comparison within the same week being scored)
+-- =====================================================================
+IF OBJECT_ID('Haleon.5Haleon_Tesco_product_group_benchmark', 'U') IS NOT NULL
+    DROP TABLE Haleon.[5Haleon_Tesco_product_group_benchmark];
+ 
+SELECT
+    s.tpnb,
+    ANY_VALUE(s.tpnb_description)                                                              AS tpnb_description,
+    sg.group_id,
+    AVG(CAST(s.sales_volume_ty AS FLOAT))                                                       AS predicted_units,
+    AVG(CAST(s.sales_value_ty AS FLOAT)) / NULLIF(AVG(CAST(s.sales_volume_ty AS FLOAT)), 0)      AS avg_price,
+    1                                                                                            AS ranged_flag   -- PLACEHOLDER — see notes below
+INTO Haleon.[5Haleon_Tesco_product_group_benchmark]
+FROM Haleon.[6bHaleon_Tesco_Current_Week_Sales] AS s
+INNER JOIN Haleon.[4Haleon_Tesco_Store_Groups] AS sg
+    ON s.store_id = sg.store_number
+GROUP BY s.tpnb, sg.group_id;
+-- NOTE on ranged_flag: hardcoded to 1 for every row, matching the
+-- Excel's actual behavior. This is a placeholder — replace with real
+-- range/planogram logic if a source ever becomes available.
+ 
+ 
+-- Validate
+-- Spot check: TPNB 78760478 (Piriteze) in Group 1 — expect
+-- predicted_units ~ 28.72, avg_price ~ £7.62
+SELECT *
+FROM Haleon.[5Haleon_Tesco_product_group_benchmark]
+WHERE tpnb = 78760478 AND group_id = 1;
+ 
+ 
+-- =====================================================================
+-- STEP 6: Enrich the current week's sales with Store Group + Product Benchmark
+-- =====================================================================
+IF OBJECT_ID('Haleon.6Haleon_Tesco_product_sales_enriched', 'U') IS NOT NULL
+    DROP TABLE Haleon.[6Haleon_Tesco_product_sales_enriched];
+ 
+SELECT
+    s.tpnb,
+    s.tpnb_description,
+    s.store_id,
+    s.year_week,
+    s.sales_value_ty,
+    s.sales_volume_ty,
+    s.stock_volume_ty,
+    sg.group_id,
+    pgb.predicted_units,
+    pgb.avg_price,
+    pgb.ranged_flag AS ranged
+INTO Haleon.[6Haleon_Tesco_product_sales_enriched]
+FROM Haleon.[6bHaleon_Tesco_Current_Week_Sales] AS s
+LEFT JOIN Haleon.[4Haleon_Tesco_Store_Groups] AS sg
+    ON s.store_id = sg.store_number
+LEFT JOIN Haleon.[5Haleon_Tesco_product_group_benchmark] AS pgb
+    ON s.tpnb = pgb.tpnb AND sg.group_id = pgb.group_id;
+ 
+ 
+-- Validate
+-- Expected: 209,798 rows, 233 distinct tpnb, 3,493 distinct stores,
+-- 1 distinct week (202613), 0 rows missing a group or predicted_units
+SELECT
+    COUNT(*)                                                    AS rows_num,
+    COUNT(DISTINCT tpnb)                                        AS distinct_tpnb,
+    COUNT(DISTINCT store_id)                                    AS distinct_stores,
+    COUNT(DISTINCT year_week)                                   AS distinct_weeks,
+    SUM(CASE WHEN group_id IS NULL THEN 1 ELSE 0 END)           AS rows_missing_group,
+    SUM(CASE WHEN predicted_units IS NULL THEN 1 ELSE 0 END)    AS rows_missing_predicted_units
+FROM Haleon.[6Haleon_Tesco_product_sales_enriched];
+ 
+ 
+-- =====================================================================
+-- STEP 7 + 8 (combined): Flag/classify/price alerts, then summarize
+-- =====================================================================
+DECLARE @hurdle_rate FLOAT = 10.0;
+ 
+ 
+-- PART A (Step 7): alerts_calc
+IF OBJECT_ID('Haleon.7Haleon_Tesco_product_alerts_calc', 'U') IS NOT NULL
+    DROP TABLE Haleon.[7Haleon_Tesco_product_alerts_calc];
+ 
+WITH flags AS (
+    SELECT
+        *,
+        CAST(sales_volume_ty AS FLOAT) / NULLIF(predicted_units, 0)      AS actual_vs_predicted,
+        CASE WHEN sales_volume_ty <= 0 THEN 1 ELSE 0 END                 AS zero_sales,
+        CASE WHEN stock_volume_ty > 0 THEN 1 ELSE 0 END                  AS has_stock
+    FROM Haleon.[6Haleon_Tesco_product_sales_enriched]
+),
+sized AS (
+    SELECT
+        *,
+        CASE WHEN ISNULL(actual_vs_predicted, 0) < 0.5 THEN 1 ELSE 0 END AS low_sales,
+        GREATEST(ISNULL(predicted_units, 0) - sales_volume_ty, 0)        AS lost_volume
+    FROM flags
+),
+priced AS (
+    SELECT
+        *,
+        ROUND(lost_volume * ISNULL(avg_price, 0), 2)                     AS size_of_prize
+    FROM sized
+),
+classified AS (
+    SELECT
+        *,
+        CASE
+            WHEN ranged = 1 AND has_stock = 0     THEN 'Ranged not stocked'
+            WHEN has_stock = 1 AND zero_sales = 1 THEN 'Stock no sales'
+            WHEN low_sales = 1                     THEN 'Low Sales'
+            ELSE 'No Alert'
+        END                                                              AS alert_type,
+        CASE WHEN size_of_prize >= @hurdle_rate THEN 1 ELSE 0 END        AS hits_hurdle
+    FROM priced
+)
+SELECT
+    *,
+    CASE
+        WHEN alert_type IN ('Low Sales', 'Ranged not stocked', 'Stock no sales')
+             AND hits_hurdle = 1 THEN 'Y'
+        ELSE 'N'
+    END AS alert_to_action
+INTO Haleon.[7Haleon_Tesco_product_alerts_calc]
+FROM classified;
+ 
+ 
+-- PART B (Step 8): Alerts Summary
+ 
+-- 8a. By alert type
+IF OBJECT_ID('Haleon.8Haleon_Tesco_sales_alerts_summary_by_type', 'U') IS NOT NULL
+    DROP TABLE Haleon.[8Haleon_Tesco_sales_alerts_summary_by_type];
+ 
+WITH actioned AS (
+    SELECT * FROM Haleon.[7Haleon_Tesco_product_alerts_calc] WHERE alert_to_action = 'Y'
+),
+totals AS (
+    SELECT COUNT(*) AS total_alerts FROM actioned
+)
+SELECT
+    a.alert_type,
+    COUNT(*)                                                       AS num_alerts,
+    ROUND(SUM(a.size_of_prize), 2)                                 AS size_of_prize,
+    ROUND(AVG(a.size_of_prize), 2)                                 AS avg_size_of_prize,
+    ROUND(CAST(COUNT(*) AS FLOAT) / NULLIF(t.total_alerts, 0), 4)  AS pct_alerts
+INTO Haleon.[8Haleon_Tesco_sales_alerts_summary_by_type]
+FROM actioned AS a
+CROSS JOIN totals t
+GROUP BY a.alert_type, t.total_alerts
+ 
+UNION ALL
+ 
+SELECT
+    'Total Alerts'                    AS alert_type,
+    COUNT(*)                          AS num_alerts,
+    ROUND(SUM(size_of_prize), 2)      AS size_of_prize,
+    ROUND(AVG(size_of_prize), 2)      AS avg_size_of_prize,
+    CAST(NULL AS FLOAT)               AS pct_alerts
+FROM Haleon.[7Haleon_Tesco_product_alerts_calc]
+WHERE alert_to_action = 'Y';
+-- NOTE: with SELECT INTO + UNION ALL, the INTO clause must appear in
+-- the FIRST SELECT of the union (as above) — T-SQL will error if you
+-- try to put it in the second branch.
+ 
+ 
+-- 8b. By product (TPNB)
+IF OBJECT_ID('Haleon.8Haleon_Tesco_sales_alerts_summary_by_product', 'U') IS NOT NULL
+    DROP TABLE Haleon.[8Haleon_Tesco_sales_alerts_summary_by_product];
+ 
+WITH actioned AS (
+    SELECT * FROM Haleon.[7Haleon_Tesco_product_alerts_calc] WHERE alert_to_action = 'Y'
+),
+totals AS (
+    SELECT COUNT(*) AS total_alerts FROM actioned
+)
+SELECT
+    a.tpnb,
+    ANY_VALUE(a.tpnb_description)                                          AS tpnb_description,
+    COUNT(*)                                                                AS num_alerts,
+    ROUND(SUM(a.size_of_prize), 2)                                          AS size_of_prize,
+    ROUND(AVG(a.size_of_prize), 2)                                          AS avg_size_of_prize,
+    ROUND(CAST(COUNT(*) AS FLOAT) / NULLIF(ANY_VALUE(t.total_alerts), 0), 4) AS pct_alerts
+INTO Haleon.[8Haleon_Tesco_sales_alerts_summary_by_product]
+FROM actioned a
+CROSS JOIN totals t
+GROUP BY a.tpnb;
+-- NOTE: the original BigQuery query had "ORDER BY size_of_prize DESC"
+-- on this CREATE TABLE AS SELECT. SQL Server's SELECT INTO does not
+-- guarantee physical storage order even if you add ORDER BY here (no
+-- table guarantees row order without a query-time ORDER BY), so it's
+-- dropped from table creation and applied instead when you query the
+-- table below.
+ 
+ 
+-- =====================================================================
+-- FINAL VALIDATION
+-- =====================================================================
+ 
+-- Step 7 check: alert type counts across ALL 209,798 rows
+-- Expected: No Alert 76,607 | Ranged not stocked 72,071 |
+--           Stock no sales 48,414 | Low Sales 12,706
+SELECT alert_type, COUNT(*) AS num_rows
+FROM Haleon.[7Haleon_Tesco_product_alerts_calc]
+GROUP BY alert_type
+ORDER BY num_rows DESC;
+ 
+-- Step 8a check: final Alerts Summary by type
+-- Expected:
+--   Low Sales             8,489 alerts / £250,599.77
+--   Ranged not stocked    8,938 alerts / £179,660.56
+--   Stock no sales        9,053 alerts / £168,478.03
+--   Total Alerts          26,480 alerts / £598,738.36
+--
+-- Real Excel ground truth for comparison:
+--   Low Sales 8,474 / £250,512.79 | Ranged not stocked 8,959 /
+--   £179,832.37 | Stock no sales 9,060 / £168,578.63 |
+--   Total 26,493 / £598,923.79
+-- (Expected ~0.05% gap is known NTILE store-boundary drift from
+-- Step 4, not an error in this logic.)
+SELECT * FROM Haleon.[8Haleon_Tesco_sales_alerts_summary_by_type]
+ORDER BY size_of_prize DESC;
+ 
+-- Step 8b check: top 5 products by £ opportunity
+-- Expected:
+--   Sensodyne Repair & Protect Orig Toothpaste 75ml   860 / £38,869.65
+--   CORSODYL MINT M/WASH 300ml                        946 / £32,268.53
+--   SENSODYNE REPAIR & PROTECT WHTNG TOOTHPASTE 75ML  623 / £31,526.76
+--   Piriteze Allergy Antihistamine Tablets 30s        882 / £31,522.49
+--   S/DYNE Pronamel GNT WHTNG SENS Toothpaste 75ml    536 / £21,378.91
+SELECT TOP 5 *
+FROM Haleon.[8Haleon_Tesco_sales_alerts_summary_by_product]
+ORDER BY size_of_prize DESC;
+
