@@ -27,9 +27,14 @@
 --     same caveat that applied when this logic first appeared).
 --
 --ASSUMPTIONS TO CONFIRM / ADJUST:
---  - Raw landing table names: Haleon.Boots_Sales_<range> (history),
---    Haleon.Boots_Sales_CurrentWeek_Raw (current week) — adjust to
---    match whatever your import actually produces.
+--  - Raw history table: Haleon.Boo_20260711_to_20260808 — this is
+--    NEVER altered or written to. Everything downstream runs against
+--    a duplicate, Haleon.Landing_Boo_20260711_to_20260808, created in
+--    Step 0 below.
+--  - Current-week raw table: Haleon.Boots_Sales_CurrentWeek_Raw
+--    (placeholder — rename to match whatever your import produces).
+--    Same protection applies: a Landing_ duplicate is made before any
+--    ALTER/UPDATE touches it.
 --  - stock_volume is AVERAGED across the week per store x article
 --    (it's a snapshot, not additive) — change to MAX/last-day if
 --    you'd rather.
@@ -37,18 +42,31 @@
 --    Boots' actual store count.
 
 -- =====================================================================
--- ADD WEEK_COMMENCING & YEAR_WEEK_NUMBER — HISTORY RAW TABLE
+-- STEP 0: Duplicate the raw history table into a Landing_ copy
+-- =====================================================================
+-- The original Haleon.Boo_20260711_to_20260808 must remain untouched —
+-- all ALTER/UPDATE work below happens on this duplicate instead.
+DROP TABLE IF EXISTS Haleon.Landing_Boo_20260711_to_20260808;
+
+SELECT *
+INTO Haleon.Landing_Boo_20260711_to_20260808
+FROM Haleon.Boo_20260711_to_20260808;
+GO
+
+-- =====================================================================
+-- ADD WEEK_COMMENCING & YEAR_WEEK_NUMBER — HISTORY LANDING TABLE
 -- =====================================================================
 -- Boots' raw file only has [Calendar] (daily date) — no pre-computed
 -- week fields like Asda's history table had, so this step is added
 -- here (Asda didn't need it for history, only for the current week).
-ALTER TABLE Haleon.Boots_Sales_202606_to_202607
+-- Runs against the Landing_ duplicate, never the original.
+ALTER TABLE Haleon.Landing_Boo_20260711_to_20260808
 ADD
     Week_Commencing DATE,
     Year_Week_Number INT;
 GO
 
-UPDATE Haleon.Boots_Sales_202606_to_202607
+UPDATE Haleon.Landing_Boo_20260711_to_20260808
 SET
     Week_Commencing =
         CAST(
@@ -93,7 +111,7 @@ SELECT
     CAST([Week_Commencing] AS DATE)                                  AS week_commencing,
     CAST([Year_Week_Number] AS INT)                                  AS year_week
 INTO Haleon.Boots_Sales_202606_to_202607_History_Normalized
-FROM Haleon.Boots_Sales_202606_to_202607
+FROM Haleon.Landing_Boo_20260711_to_20260808
 WHERE [Calendar] >= @load_start_date;
 GO
 
@@ -204,16 +222,27 @@ GO
 
 
 -- #######################################################################
--- ##  ADD WEEK_COMMENCING & YEAR_WEEK_NUMBER FIELD — CURRENT WEEK TABLE
+-- ##  DUPLICATE CURRENT-WEEK RAW TABLE INTO LANDING (same protection
+-- ##  as the history table — original raw file is never altered)
+-- #######################################################################
+DROP TABLE IF EXISTS Haleon.Landing_Boots_CurrentWeek;
+
+SELECT *
+INTO Haleon.Landing_Boots_CurrentWeek
+FROM Haleon.Boots_Sales_CurrentWeek_Raw;   -- <-- rename to match your actual current-week raw table
+GO
+
+-- #######################################################################
+-- ##  ADD WEEK_COMMENCING & YEAR_WEEK_NUMBER FIELD — CURRENT WEEK LANDING
 -- #######################################################################
 
-ALTER TABLE Haleon.Boots_Sales_CurrentWeek_Raw
+ALTER TABLE Haleon.Landing_Boots_CurrentWeek
 ADD
     Week_Commencing DATE,
     Year_Week_Number INT;
 GO
 
-UPDATE Haleon.Boots_Sales_CurrentWeek_Raw
+UPDATE Haleon.Landing_Boots_CurrentWeek
 SET
     Week_Commencing =
         CAST(
@@ -263,7 +292,7 @@ SELECT
     CAST([Week_Commencing] AS DATE)                                  AS week_commencing,
     CAST([Year_Week_Number] AS INT)                                  AS year_week
 INTO Haleon.Boots_CurrentWeek_Normalized
-FROM Haleon.Boots_Sales_CurrentWeek_Raw;
+FROM Haleon.Landing_Boots_CurrentWeek;
 GO
 
 -- =====================================================================
