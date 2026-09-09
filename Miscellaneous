@@ -1,3 +1,9 @@
+Msg 137, Level 15, State 2, Line 188
+Must declare the scalar variable "@num_groups".
+Msg 137, Level 15, State 2, Line 200
+Must declare the scalar variable "@history_start_date".
+
+
 Boots epos sample data:
 Calendar	Store_Id	Product	Total_Sales_Amount_per_Store	Total_Sales_Volume_per_Store_Units	Store_On_Hand_Volume_Units
 2026-11-07	6045	1762745 - Sensodyne Clinical White Enamel Strength	0	0	4
